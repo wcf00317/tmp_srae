@@ -1,0 +1,33 @@
+# configs/collect_acts.yaml
+model:
+  # 你的本地模型主目录（和你示意中的 model_id 一致）
+  model_id: /mnt/hdfs/foundation/agent/heyc/ckpts/Qwen3-1.7B
+  # 如果有 LoRA/PEFT，请改成 LoRA 路径；没有就与 model_id 相同
+  peft_model_id: /mnt/hdfs/foundation/agent/heyc/ckpts/Qwen3-1.7B
+  attn_implementation: flash_attention_2
+  dtype: bfloat16
+  device_map: auto
+  local_files_only: true
+  trust_remote_code: true
+
+data:
+  hf_name: gsm8k
+  hf_config: main
+  split: test         # 可选 train/test
+  limit: 100          # 先抽样 100 条，跑通流程；设 null 跑全量
+
+collect:
+  layers: [8, 16, 24] # 你关心的层索引（基于 transformer block 序号）
+  max_new_tokens: 128
+  temperature: 0.0    # 0 = 贪婪
+  top_p: 1.0
+  stop_on_eos: true
+  save_dir: shards/acts/test
+
+prompt:
+  # 用 chat 模板提示模型“展示推理过程”（便于产生推理片段）
+  system: "You are a careful math tutor. Solve step by step and show your reasoning, then give the final answer."
+  user_suffix: " Let's think step by step."
+
+io:
+  write_text_preview: true  # 额外写一份 .txt 预览（问题/生成/答案）
