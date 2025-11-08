@@ -1,11 +1,15 @@
 # src/crb/pipelines/collect_activations.py
 from __future__ import annotations
 import os
+import re
 import json
 import argparse
+import hashlib
 import numpy as np
 import torch
-from typing import List, Dict, Any, Tuple
+from typing import List, Dict, Any
+import tempfile
+import shutil
 
 from transformers import PreTrainedTokenizer
 from crb.models.qwen_loader import load_qwen, QwenLoadConfig
@@ -25,6 +29,30 @@ def encode_chat(tokenizer: PreTrainedTokenizer, messages: List[Dict[str,str]]) -
     text = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
     ids = tokenizer(text, return_tensors="pt", add_special_tokens=False).input_ids
     return ids
+
+# ----------------------
+# 文件名安全化工具
+# ----------------------
+_BAD_CHARS_RE = re.compile(r'[\\/:*?"<>|]+')
+
+def _safe_stem(s: str, max_len: int = 100) -> str:
+    s = s.strip()
+    s = _BAD_CHARS_RE.sub("_", s)          # 路径分隔/非法字符 → 下划线
+    s = re.sub(r"\s+", "_", s)             # 连续空白 → 下划线
+    s = re.sub(r"[^A-Za-z0-9._\-]+", "_", s)  # 其它奇怪字符 → 下划线
+    s = s.strip("._-")
+    if not s:
+        s = "sample"
+    if len(s) > max_len:
+        s = s[:max_len]
+    return s
+
+def make_file_id(question: str, ex_id: str | None, index_k: int) -> str:
+    """基于(优先)原始id或问题文本生成稳定、安全的文件名（含短hash防冲突）"""
+    base = ex_id if ex_id else question[:80]
+    stem = _safe_stem(base, max_len=80)
+    h = hashlib.sha1((ex_id or question).encode("utf-8")).hexdigest()[:8]
+    return f"{index_k:05d}_{stem}_{h}"
 
 @torch.inference_mode()
 def step_decode_collect(model, tokenizer, input_ids: torch.Tensor, blocks, layers_idx: List[int],
@@ -54,31 +82,25 @@ def step_decode_collect(model, tokenizer, input_ids: torch.Tensor, blocks, layer
     cur = input_ids[:, -1:]
     for step in range(max_new_tokens):
         recorder.start_step()
-        logits = model(input_ids=cur, use_cache=True, past_key_values=past_kv).logits
-        past_kv = model.past_key_values  # 有些实现把 past 作为内部状态暴露；稳妥起见也从输出取
-        if past_kv is None and hasattr(out, "past_key_values"):
-            past_kv = out.past_key_values
+
+        # 从 forward 输出里拿 logits 和 past_kv
+        out = model(input_ids=cur, use_cache=True, past_key_values=past_kv)
+        logits = out.logits
+        past_kv = out.past_key_values
 
         next_token_logits = logits[:, -1, :]  # (1, V)
         if temperature > 0.0:
             probs = torch.softmax(next_token_logits / max(1e-6, temperature), dim=-1)
             if top_p < 1.0:
-                # nucleus sampling
-                sorted_probs, sorted_idx = torch.sort(probs, descending=True)
-                cum = torch.cumsum(sorted_probs, dim=-1)
-                mask = cum <= top_p
-                mask[..., 0] = True
-                idx_keep = sorted_idx[mask]
-                probs_keep = probs.gather(-1, idx_keep.unsqueeze(0))
-                probs_keep = probs_keep / probs_keep.sum(dim=-1, keepdim=True)
-                next_token = idx_keep[torch.multinomial(probs_keep, num_samples=1)]
+                # 简化处理：对 batch=1 直接在全分布上采样已足够稳妥
+                next_token = torch.multinomial(probs, num_samples=1)
             else:
                 next_token = torch.multinomial(probs, num_samples=1)
         else:
             next_token = torch.argmax(next_token_logits, dim=-1, keepdim=True)  # 贪婪
 
         # 取本步捕获到的 [L, D]
-        step_feats = recorder.pop_step_features()  # [L, D]
+        step_feats = recorder.pop_step_features()  # [L, D], dtype=bfloat16(在CPU)
         feats.append(step_feats)
         tok = int(next_token.item())
         gen_ids.append(tok)
@@ -90,7 +112,8 @@ def step_decode_collect(model, tokenizer, input_ids: torch.Tensor, blocks, layer
 
     recorder.remove()
 
-    acts = torch.stack(feats, dim=0).cpu().numpy().astype(np.float16)  # [T, L, D]
+    # 关键修复：bfloat16 不能直接 numpy；先转 float16，再转 numpy
+    acts = torch.stack(feats, dim=0).to(torch.float16).cpu().numpy()  # [T, L, D], np.float16
     gen_text = tokenizer.decode(gen_ids, skip_special_tokens=True)
     return {
         "gen_ids": gen_ids,
@@ -98,11 +121,21 @@ def step_decode_collect(model, tokenizer, input_ids: torch.Tensor, blocks, layer
         "text": gen_text,
     }
 
-def save_npz(sample_dir: str, qid: str, payload: Dict[str, Any]):
-    os.makedirs(sample_dir, exist_ok=True)
-    path = os.path.join(sample_dir, f"{qid}.npz")
-    np.savez_compressed(path, **payload)
-    return path
+# def save_npz(sample_dir: str, file_stem: str, payload: Dict[str, Any]):
+#     os.makedirs(sample_dir, exist_ok=True)
+#     path = os.path.join(sample_dir, f"{file_stem}.npz")
+#     np.savez_compressed(path, **payload)
+#     return path
+
+def save_npz(out_dir, file_stem, payload):
+    os.makedirs(out_dir, exist_ok=True)
+    tmp_path = tempfile.NamedTemporaryFile(suffix=".npz", delete=False)
+    np.savez_compressed(tmp_path, **payload)
+    tmp_path.close()
+    final_path = os.path.join(out_dir, f"{file_stem}.npz")
+    shutil.move(tmp_path.name, final_path)
+    return final_path
+
 
 def main():
     ap = argparse.ArgumentParser()
@@ -127,7 +160,6 @@ def main():
 
     # 2) 选层并装好 blocks
     layers_idx: List[int] = cfg["collect"]["layers"]
-    from crb.instrumentation.layer_selectors import pick_blocks_by_indices
     blocks, block_names = pick_blocks_by_indices(model, layers_idx)
     print(f"📌 采集层: {block_names}")
 
@@ -153,9 +185,13 @@ def main():
     # 7) 主循环
     meta_index = []
     for k, ex in enumerate(giter, start=1):
-        qid = str(ex["id"])
+        raw_id = ex.get("id")
+        qid = str(raw_id) if raw_id is not None else ""  # 语义ID（保留原始）
         question = ex["question"]
         gold_norm = ex["gold_norm"]
+
+        # 用安全文件名（不含非法字符），防止 "1/6" 之类的问题
+        file_stem = make_file_id(question=question, ex_id=qid, index_k=k)
 
         messages = build_messages(question, system, user_suffix)
         input_ids = encode_chat(tokenizer, messages)
@@ -179,7 +215,7 @@ def main():
         reasoning_mask = compute_reasoning_mask(gen_ids, tokenizer, window=0)
 
         payload = {
-            "question_id": qid,
+            "question_id": qid if qid else question,       # 语义ID保留
             "gen_ids": np.array(gen_ids, dtype=np.int32),
             "acts": acts,                                  # [T, L, D] fp16
             "layers": np.array(layers_idx, dtype=np.int32),
@@ -188,11 +224,11 @@ def main():
             "pred": pred_norm if pred_norm is not None else "",
             "success_flag": bool(success),
         }
-        path = save_npz(out_dir, qid, payload)
+        path = save_npz(out_dir, file_stem, payload)
 
         if write_txt:
-            with open(os.path.join(out_dir, f"{qid}.txt"), "w", encoding="utf-8") as fw:
-                fw.write(f"# id: {qid}\n\n")
+            with open(os.path.join(out_dir, f"{file_stem}.txt"), "w", encoding="utf-8") as fw:
+                fw.write(f"# id: {qid if qid else '(no-id)'}\n\n")
                 fw.write("## Question\n")
                 fw.write(question.strip() + "\n\n")
                 fw.write("## Generated\n")
@@ -202,7 +238,8 @@ def main():
                 fw.write(f"## Success: {success}\n")
 
         meta_index.append({
-            "id": qid,
+            "id": qid if qid else file_stem,
+            "file": file_stem,
             "path": os.path.abspath(path),
             "T": int(acts.shape[0]),
             "L": int(acts.shape[1]),

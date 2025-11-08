@@ -1,0 +1,19 @@
+data:
+  layer_dir: run/rsae_corpus/layer1
+model:
+  d_code: 8192         # 通常 4xD；你也可 8xD 看显存
+  tied: false
+  warmstart_path: null # 也可放 EleutherAI 兼容权重 .pt（形状匹配的键会被加载）
+train:
+  lr: 5.0e-4
+  batch_size: 512
+  epochs: 2
+  max_steps: 0         # 0 表示不限制；否则以步数为准
+  amp: true
+  val_every: 500
+loss:
+  l1_lambda: 1.0e-3
+  l1_warmup_steps: 2000
+io:
+  save_dir: run/rsae_ckpts/layer1_v0
+  log_every: 50
